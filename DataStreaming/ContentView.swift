@@ -14,9 +14,11 @@ import Combine
 
 struct ContentView: View {
     @StateObject private var sensorManager = SensorManager()
+    @State private var showSettings = false
+    @State private var isSessionActive = false
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack {
             // RealityView と ARSession を連携
             RealityView { content in
                 content.camera = .spatialTracking
@@ -26,21 +28,184 @@ struct ContentView: View {
                 Color.clear
             }
             .ignoresSafeArea()
-            .onAppear { sensorManager.startAll() }
-            .onDisappear { sensorManager.stopAll() }
 
-            // 簡易な状態表示
-            VStack(spacing: 8) {
-                Text("Camera: \(sensorManager.cameraState)")
-                Text("Depth: \(sensorManager.depthState)")
-                Text("IMU: \(sensorManager.imuState)")
-                Text("Location: \(sensorManager.locationState)")
+            // オーバーレイUI
+            VStack {
+                // 上部: 設定ボタン
+                HStack {
+                    Spacer()
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Image(systemName: "gearshape.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                            .padding(12)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .disabled(isSessionActive)
+                    .opacity(isSessionActive ? 0.5 : 1.0)
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+
+                Spacer()
+
+                // 下部: ステータスと録画コントロール
+                VStack(spacing: 12) {
+                    // センサー状態表示
+                    SensorStatusPanel(sensorManager: sensorManager)
+
+                    // 録画コントロール
+                    SessionControlPanel(
+                        isActive: $isSessionActive,
+                        isRecording: $sensorManager.status.isRecording,
+                        onStart: { sensorManager.startAll() },
+                        onStop: { sensorManager.stopAll() }
+                    )
+                }
+                .padding()
             }
-            .font(.footnote)
-            .padding(10)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .padding()
         }
+        .sheet(isPresented: $showSettings) {
+            SettingsView(settings: $sensorManager.settings)
+        }
+    }
+}
+
+// MARK: - Sensor Status Panel
+
+struct SensorStatusPanel: View {
+    @ObservedObject var sensorManager: SensorManager
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 16) {
+                StatusIndicator(
+                    icon: "camera.fill",
+                    label: "Camera",
+                    status: sensorManager.status.camera
+                )
+                StatusIndicator(
+                    icon: "cube.transparent",
+                    label: "Depth",
+                    status: sensorManager.status.depth
+                )
+                StatusIndicator(
+                    icon: "gyroscope",
+                    label: "IMU",
+                    status: sensorManager.status.imu
+                )
+                StatusIndicator(
+                    icon: "location.fill",
+                    label: "Location",
+                    status: sensorManager.status.location
+                )
+            }
+
+            // 詳細情報
+            VStack(spacing: 2) {
+                Text(sensorManager.cameraState)
+                Text(sensorManager.depthState)
+                Text(sensorManager.imuState)
+                Text(sensorManager.locationState)
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+// MARK: - Status Indicator
+
+struct StatusIndicator: View {
+    let icon: String
+    let label: String
+    let status: SensorStatus
+
+    var statusColor: Color {
+        switch status {
+        case .running:
+            return .green
+        case .paused:
+            return .yellow
+        case .error:
+            return .red
+        case .unavailable, .denied:
+            return .gray
+        case .idle:
+            return .blue
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Circle()
+                    .fill(statusColor.opacity(0.2))
+                    .frame(width: 36, height: 36)
+
+                Image(systemName: icon)
+                    .font(.system(size: 16))
+                    .foregroundStyle(statusColor)
+            }
+
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Session Control Panel
+
+struct SessionControlPanel: View {
+    @Binding var isActive: Bool
+    @Binding var isRecording: Bool
+    var onStart: () -> Void
+    var onStop: () -> Void
+
+    var body: some View {
+        HStack(spacing: 20) {
+            // 開始/停止ボタン
+            Button {
+                if isActive {
+                    onStop()
+                    isActive = false
+                    isRecording = false
+                } else {
+                    onStart()
+                    isActive = true
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isActive ? "stop.fill" : "play.fill")
+                    Text(isActive ? "停止" : "開始")
+                }
+                .font(.headline)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+                .background(isActive ? Color.red : Color.green, in: Capsule())
+            }
+
+            // 録画ボタン（セッションがアクティブな場合のみ有効）
+            Button {
+                isRecording.toggle()
+            } label: {
+                Image(systemName: isRecording ? "record.circle.fill" : "record.circle")
+                    .font(.system(size: 32))
+                    .foregroundStyle(isRecording ? .red : .white)
+                    .symbolEffect(.pulse, options: .repeating, isActive: isRecording)
+            }
+            .disabled(!isActive)
+            .opacity(isActive ? 1.0 : 0.5)
+        }
+        .padding(12)
+        .background(.ultraThinMaterial, in: Capsule())
     }
 }
 
