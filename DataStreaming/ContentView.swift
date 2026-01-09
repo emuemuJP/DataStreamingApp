@@ -15,7 +15,10 @@ import Combine
 struct ContentView: View {
     @StateObject private var sensorManager = SensorManager()
     @State private var showSettings = false
+    @State private var showRecordings = false
     @State private var isSessionActive = false
+    @State private var showError = false
+    @State private var errorMessage = ""
 
     var body: some View {
         ZStack {
@@ -31,9 +34,41 @@ struct ContentView: View {
 
             // オーバーレイUI
             VStack {
-                // 上部: 設定ボタン
+                // 上部: ツールバー
                 HStack {
+                    // 録画一覧ボタン
+                    Button {
+                        showRecordings = true
+                    } label: {
+                        Image(systemName: "folder.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                            .padding(12)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+
                     Spacer()
+
+                    // 録画中表示
+                    if sensorManager.status.isRecording {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(.red)
+                                .frame(width: 8, height: 8)
+                            Text("REC")
+                                .font(.caption.bold())
+                            Text("\(sensorManager.recordingManager.frameCount) frames")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: Capsule())
+                    }
+
+                    Spacer()
+
+                    // 設定ボタン
                     Button {
                         showSettings = true
                     } label: {
@@ -61,7 +96,8 @@ struct ContentView: View {
                         isActive: $isSessionActive,
                         isRecording: $sensorManager.status.isRecording,
                         onStart: { sensorManager.startAll() },
-                        onStop: { sensorManager.stopAll() }
+                        onStop: { sensorManager.stopAll() },
+                        onRecordingToggle: { toggleRecording() }
                     )
                 }
                 .padding()
@@ -69,6 +105,27 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: $sensorManager.settings)
+        }
+        .sheet(isPresented: $showRecordings) {
+            RecordingsListView()
+        }
+        .alert("エラー", isPresented: $showError) {
+            Button("OK") { }
+        } message: {
+            Text(errorMessage)
+        }
+    }
+
+    private func toggleRecording() {
+        do {
+            if sensorManager.status.isRecording {
+                _ = try sensorManager.stopRecording()
+            } else {
+                try sensorManager.startRecording()
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            showError = true
         }
     }
 }
@@ -167,15 +224,18 @@ struct SessionControlPanel: View {
     @Binding var isRecording: Bool
     var onStart: () -> Void
     var onStop: () -> Void
+    var onRecordingToggle: () -> Void
 
     var body: some View {
         HStack(spacing: 20) {
             // 開始/停止ボタン
             Button {
                 if isActive {
+                    if isRecording {
+                        onRecordingToggle()
+                    }
                     onStop()
                     isActive = false
-                    isRecording = false
                 } else {
                     onStart()
                     isActive = true
@@ -194,7 +254,7 @@ struct SessionControlPanel: View {
 
             // 録画ボタン（セッションがアクティブな場合のみ有効）
             Button {
-                isRecording.toggle()
+                onRecordingToggle()
             } label: {
                 Image(systemName: isRecording ? "record.circle.fill" : "record.circle")
                     .font(.system(size: 32))
@@ -226,6 +286,10 @@ final class SensorManager: NSObject, ObservableObject {
     // MARK: - Settings
     @Published var settings = RecordingSettings.default
 
+    // MARK: - Recording
+    let recordingManager = RecordingManager()
+    @Published var recordingSessionId: String?
+
     // MARK: - Frame counter
     private var frameCounter: UInt64 = 0
 
@@ -244,6 +308,21 @@ final class SensorManager: NSObject, ObservableObject {
         locationManager.delegate = self
     }
 
+    // MARK: - Recording control
+
+    func startRecording() throws {
+        let sessionId = try recordingManager.startRecording(settings: settings)
+        recordingSessionId = sessionId
+        status.isRecording = true
+    }
+
+    func stopRecording() throws -> URL? {
+        let url = try recordingManager.stopRecording()
+        recordingSessionId = nil
+        status.isRecording = false
+        return url
+    }
+
     // MARK: - Current sensor frame
     func currentSensorFrame() -> SensorFrame {
         frameCounter += 1
@@ -255,6 +334,13 @@ final class SensorManager: NSObject, ObservableObject {
             imu: latestIMU,
             location: latestLocation
         )
+    }
+
+    /// センサーフレームを録画（録画中の場合）
+    private func recordCurrentFrame() {
+        guard status.isRecording else { return }
+        let frame = currentSensorFrame()
+        recordingManager.recordFrame(frame)
     }
 
     // MARK: - Public control
@@ -525,6 +611,9 @@ extension SensorManager: ARSessionDelegate {
 
         cameraState = String(format: "t:%.2f", t)
         status.camera = .running
+
+        // フレームを録画
+        recordCurrentFrame()
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
