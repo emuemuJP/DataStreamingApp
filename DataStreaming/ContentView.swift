@@ -46,10 +46,23 @@ struct ContentView: View {
 
 final class SensorManager: NSObject, ObservableObject {
     // MARK: - Published states
+    @Published var status = SensorSystemStatus()
     @Published var cameraState: String = "idle"
     @Published var depthState: String = "idle"
     @Published var imuState: String = "idle"
     @Published var locationState: String = "idle"
+
+    // MARK: - Latest sensor data (structured)
+    @Published private(set) var latestARFrame: ARFrameSnapshot?
+    @Published private(set) var latestPointCloud: PointCloudSnapshot?
+    @Published private(set) var latestIMU: IMUSnapshot?
+    @Published private(set) var latestLocation: LocationSnapshot?
+
+    // MARK: - Settings
+    @Published var settings = RecordingSettings.default
+
+    // MARK: - Frame counter
+    private var frameCounter: UInt64 = 0
 
     // MARK: - AR
     private let arSession = ARSession()
@@ -64,6 +77,19 @@ final class SensorManager: NSObject, ObservableObject {
         super.init()
         arSession.delegate = self
         locationManager.delegate = self
+    }
+
+    // MARK: - Current sensor frame
+    func currentSensorFrame() -> SensorFrame {
+        frameCounter += 1
+        return SensorFrame(
+            frameId: frameCounter,
+            timestamp: .now(),
+            arFrame: latestARFrame,
+            pointCloud: settings.recordPointCloud ? latestPointCloud : nil,
+            imu: latestIMU,
+            location: latestLocation
+        )
     }
 
     // MARK: - Public control
@@ -107,15 +133,7 @@ final class SensorManager: NSObject, ObservableObject {
         depthState = (ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) ? "enabled" : "unavailable")
     }
 
-    // MARK: - Point Cloud
-    struct PointXYZRGB {
-        var x: Float
-        var y: Float
-        var z: Float
-        var r: UInt8
-        var g: UInt8
-        var b: UInt8
-    }
+    // MARK: - Point Cloud (using PointXYZRGB from Models.swift)
 
     private func generatePointCloud(from depth: ARDepthData, frame: ARFrame, downsample: Int = 4) -> [PointXYZRGB] {
         // depth.depthMap: CVPixelBuffer (kCVPixelFormatType_DepthFloat32)
@@ -220,22 +238,35 @@ final class SensorManager: NSObject, ObservableObject {
     private func startMotion() {
         guard motion.isDeviceMotionAvailable else {
             imuState = "unavailable"
+            status.imu = .unavailable
             return
         }
-        motion.deviceMotionUpdateInterval = 1.0 / 100.0 // 100 Hz
+        motion.deviceMotionUpdateInterval = 1.0 / settings.imuSamplingRate
         motion.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: .main) { [weak self] dm, err in
             guard let self, let dm else { return }
             // timestamp は起動後の経過秒
             let t = dm.timestamp
+            let syncTimestamp = SyncTimestamp.fromSensorTimestamp(t)
+
             let acc = dm.userAcceleration
             let gyro = dm.rotationRate
             let quat = dm.attitude.quaternion
+            let grav = dm.gravity
+
+            // IMUスナップショットを保存
+            self.latestIMU = IMUSnapshot(
+                timestamp: syncTimestamp,
+                userAcceleration: Vector3(x: acc.x, y: acc.y, z: acc.z),
+                rotationRate: Vector3(x: gyro.x, y: gyro.y, z: gyro.z),
+                attitude: Quaternion(x: quat.x, y: quat.y, z: quat.z, w: quat.w),
+                gravity: Vector3(x: grav.x, y: grav.y, z: grav.z)
+            )
+
             self.imuState = String(format: "%.2f s  ax:%.2f ay:%.2f az:%.2f", t, acc.x, acc.y, acc.z)
-            // TODO: サーバ送信用にバッチ化・エンコード
-            _ = gyro
-            _ = quat
+            self.status.imu = .running
         }
         imuState = "running"
+        status.imu = .running
     }
 
     // MARK: - Location setup
@@ -252,35 +283,102 @@ extension SensorManager: ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         // カメラフレームのタイムスタンプ（秒）
         let t = frame.timestamp
-        // カラー画像
-        let pixelBuffer = frame.capturedImage
-        // 深度（対応端末のみ）
-        if let depth = frame.sceneDepth ?? frame.smoothedSceneDepth {
-            let pts = generatePointCloud(from: depth, frame: frame, downsample: 4)
-            depthState = String(format: "t:%.2f depth: w:%d h:%d pts:%d", t, CVPixelBufferGetWidth(depth.depthMap), CVPixelBufferGetHeight(depth.depthMap), pts.count)
-            _ = pixelBuffer
-        } else {
-            depthState = "no-depth"
+        let syncTimestamp = SyncTimestamp.fromSensorTimestamp(t)
+
+        // カメラ内部パラメータ
+        let intrinsics = frame.camera.intrinsics
+        let cameraIntrinsics = CameraIntrinsics(
+            fx: intrinsics[0, 0],
+            fy: intrinsics[1, 1],
+            cx: intrinsics[0, 2],
+            cy: intrinsics[1, 2]
+        )
+
+        // トラッキング状態
+        let trackingState: String
+        switch frame.camera.trackingState {
+        case .normal:
+            trackingState = "normal"
+        case .limited(let reason):
+            switch reason {
+            case .initializing:
+                trackingState = "initializing"
+            case .excessiveMotion:
+                trackingState = "excessiveMotion"
+            case .insufficientFeatures:
+                trackingState = "insufficientFeatures"
+            case .relocalizing:
+                trackingState = "relocalizing"
+            @unknown default:
+                trackingState = "unknown"
+            }
+        case .notAvailable:
+            trackingState = "notAvailable"
         }
 
-        // TODO: カメラ画像のエンコード（H.264/HEVC）やサーバ送信のキューイング
+        // カラー画像
+        let pixelBuffer = frame.capturedImage
+        let imageWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let imageHeight = CVPixelBufferGetHeight(pixelBuffer)
+
+        // 深度（対応端末のみ）
+        var depthWidth: Int?
+        var depthHeight: Int?
+
+        if let depth = frame.sceneDepth ?? frame.smoothedSceneDepth {
+            depthWidth = CVPixelBufferGetWidth(depth.depthMap)
+            depthHeight = CVPixelBufferGetHeight(depth.depthMap)
+
+            let pts = generatePointCloud(from: depth, frame: frame, downsample: settings.pointCloudDownsample)
+
+            // ポイントクラウドスナップショットを保存
+            latestPointCloud = PointCloudSnapshot(
+                timestamp: syncTimestamp,
+                points: pts,
+                downsampleFactor: settings.pointCloudDownsample
+            )
+
+            depthState = String(format: "t:%.2f w:%d h:%d pts:%d", t, depthWidth!, depthHeight!, pts.count)
+            status.depth = .running
+        } else {
+            depthState = "no-depth"
+            status.depth = .unavailable
+            latestPointCloud = nil
+        }
+
+        // ARフレームスナップショットを保存
+        latestARFrame = ARFrameSnapshot(
+            timestamp: syncTimestamp,
+            intrinsics: cameraIntrinsics,
+            cameraTransform: Transform4x4(from: frame.camera.transform),
+            imageWidth: imageWidth,
+            imageHeight: imageHeight,
+            depthWidth: depthWidth,
+            depthHeight: depthHeight,
+            trackingState: trackingState
+        )
+
         cameraState = String(format: "t:%.2f", t)
+        status.camera = .running
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
         cameraState = "error: \(error.localizedDescription)"
+        status.camera = .error
     }
 }
 
 // MARK: - CLLocationManagerDelegate
 extension SensorManager: CLLocationManagerDelegate {
-    func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) {
-        switch status {
+    func locationManager(_ manager: CLLocationManager, didChangeAuthorization authStatus: CLAuthorizationStatus) {
+        switch authStatus {
         case .authorizedAlways, .authorizedWhenInUse:
             manager.startUpdatingLocation()
             locationState = "running"
+            status.location = .running
         case .denied, .restricted:
             locationState = "denied"
+            status.location = .denied
         case .notDetermined:
             locationState = "requesting"
         @unknown default:
@@ -290,16 +388,21 @@ extension SensorManager: CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
+
+        // LocationSnapshotを保存
+        latestLocation = LocationSnapshot(from: loc)
+
         let t = loc.timestamp.timeIntervalSince1970
         let lat = loc.coordinate.latitude
         let lon = loc.coordinate.longitude
         let acc = loc.horizontalAccuracy
         locationState = String(format: "t:%.0f  lat:%.5f lon:%.5f ±%.1fm", t, lat, lon, acc)
-        // TODO: サーバ送信用に構造体化して送信
+        status.location = .running
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         locationState = "error: \(error.localizedDescription)"
+        status.location = .error
     }
 }
 
