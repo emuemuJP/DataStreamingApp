@@ -14,8 +14,10 @@ import Combine
 
 struct ContentView: View {
     @StateObject private var sensorManager = SensorManager()
+    @StateObject private var streamingClient = StreamingClient()
     @State private var showSettings = false
     @State private var showRecordings = false
+    @State private var showStreaming = false
     @State private var isSessionActive = false
     @State private var showError = false
     @State private var errorMessage = ""
@@ -47,24 +49,60 @@ struct ContentView: View {
                             .background(.ultraThinMaterial, in: Circle())
                     }
 
+                    // ストリーミングボタン
+                    Button {
+                        showStreaming = true
+                    } label: {
+                        ZStack {
+                            Image(systemName: "antenna.radiowaves.left.and.right")
+                                .font(.title2)
+                                .foregroundStyle(streamingClient.connectionState.isConnected ? .green : .white)
+                                .padding(12)
+                                .background(.ultraThinMaterial, in: Circle())
+
+                            if streamingClient.connectionState.isConnected {
+                                Circle()
+                                    .fill(.green)
+                                    .frame(width: 8, height: 8)
+                                    .offset(x: 14, y: -14)
+                            }
+                        }
+                    }
+
                     Spacer()
 
-                    // 録画中表示
-                    if sensorManager.status.isRecording {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(.red)
-                                .frame(width: 8, height: 8)
-                            Text("REC")
-                                .font(.caption.bold())
-                            Text("\(sensorManager.recordingManager.frameCount) frames")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                    // ステータス表示
+                    VStack(spacing: 4) {
+                        // 録画中表示
+                        if sensorManager.status.isRecording {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(.red)
+                                    .frame(width: 8, height: 8)
+                                Text("REC")
+                                    .font(.caption.bold())
+                                Text("\(sensorManager.recordingManager.frameCount)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(.ultraThinMaterial, in: Capsule())
+
+                        // ストリーミング中表示
+                        if streamingClient.connectionState.isConnected {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.up.circle.fill")
+                                    .foregroundStyle(.green)
+                                    .font(.caption)
+                                Text("\(streamingClient.sentFrameCount)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .opacity((sensorManager.status.isRecording || streamingClient.connectionState.isConnected) ? 1 : 0)
 
                     Spacer()
 
@@ -95,8 +133,14 @@ struct ContentView: View {
                     SessionControlPanel(
                         isActive: $isSessionActive,
                         isRecording: $sensorManager.status.isRecording,
-                        onStart: { sensorManager.startAll() },
-                        onStop: { sensorManager.stopAll() },
+                        onStart: {
+                            sensorManager.startAll()
+                            sensorManager.streamingClient = streamingClient
+                        },
+                        onStop: {
+                            sensorManager.stopAll()
+                            sensorManager.streamingClient = nil
+                        },
                         onRecordingToggle: { toggleRecording() }
                     )
                 }
@@ -108,6 +152,11 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showRecordings) {
             RecordingsListView()
+        }
+        .sheet(isPresented: $showStreaming) {
+            NavigationStack {
+                StreamingSettingsView(client: streamingClient)
+            }
         }
         .alert("エラー", isPresented: $showError) {
             Button("OK") { }
@@ -290,6 +339,9 @@ final class SensorManager: NSObject, ObservableObject {
     let recordingManager = RecordingManager()
     @Published var recordingSessionId: String?
 
+    // MARK: - Streaming
+    var streamingClient: StreamingClient?
+
     // MARK: - Frame counter
     private var frameCounter: UInt64 = 0
 
@@ -336,11 +388,25 @@ final class SensorManager: NSObject, ObservableObject {
         )
     }
 
-    /// センサーフレームを録画（録画中の場合）
+    /// センサーフレームを録画・ストリーミング
     private func recordCurrentFrame() {
-        guard status.isRecording else { return }
+        // 録画もストリーミングも無効な場合はスキップ
+        let shouldRecord = status.isRecording
+        let shouldStream = streamingClient?.connectionState.isConnected ?? false
+
+        guard shouldRecord || shouldStream else { return }
+
         let frame = currentSensorFrame()
-        recordingManager.recordFrame(frame)
+
+        // 録画
+        if shouldRecord {
+            recordingManager.recordFrame(frame)
+        }
+
+        // ストリーミング
+        if shouldStream {
+            streamingClient?.enqueueFrame(frame)
+        }
     }
 
     // MARK: - Public control
