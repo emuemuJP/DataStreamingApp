@@ -14,6 +14,7 @@ struct RecordingsListView: View {
     @State private var errorMessage = ""
     @State private var showShareSheet = false
     @State private var shareURL: URL?
+    @State private var selectedSession: RecordingSessionInfo?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -28,22 +29,27 @@ struct RecordingsListView: View {
                 } else {
                     List {
                         ForEach(sessions) { session in
-                            SessionRow(session: session)
-                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                    Button(role: .destructive) {
-                                        deleteSession(session)
-                                    } label: {
-                                        Label("削除", systemImage: "trash")
-                                    }
+                            Button {
+                                selectedSession = session
+                            } label: {
+                                SessionRow(session: session)
+                            }
+                            .buttonStyle(.plain)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button(role: .destructive) {
+                                    deleteSession(session)
+                                } label: {
+                                    Label("削除", systemImage: "trash")
                                 }
-                                .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                                    Button {
-                                        shareSession(session)
-                                    } label: {
-                                        Label("共有", systemImage: "square.and.arrow.up")
-                                    }
-                                    .tint(.blue)
+                            }
+                            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                                Button {
+                                    shareSession(session)
+                                } label: {
+                                    Label("共有", systemImage: "square.and.arrow.up")
                                 }
+                                .tint(.blue)
+                            }
                         }
                     }
                 }
@@ -76,6 +82,9 @@ struct RecordingsListView: View {
                 if let url = shareURL {
                     ShareSheet(url: url)
                 }
+            }
+            .sheet(item: $selectedSession) { session in
+                SessionDetailView(session: session)
             }
         }
     }
@@ -150,6 +159,137 @@ struct ShareSheet: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+// MARK: - Session Detail View
+
+struct SessionDetailView: View {
+    let session: RecordingSessionInfo
+    @State private var isExporting = false
+    @State private var exportFormat: PointCloudFormat = .ply
+    @State private var showExportSuccess = false
+    @State private var showError = false
+    @State private var errorMessage = ""
+    @State private var exportedURL: URL?
+    @State private var showShareSheet = false
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("セッション情報") {
+                    LabeledContent("開始時刻") {
+                        Text(session.startTime, style: .date)
+                        Text(session.startTime, style: .time)
+                    }
+
+                    if let endTime = session.endTime {
+                        LabeledContent("終了時刻") {
+                            Text(endTime, style: .date)
+                            Text(endTime, style: .time)
+                        }
+                    }
+
+                    LabeledContent("録画時間", value: session.formattedDuration)
+                    LabeledContent("フレーム数", value: "\(session.frameCount)")
+                    LabeledContent("ファイルサイズ", value: session.formattedFileSize)
+                }
+
+                Section("セッションID") {
+                    Text(session.sessionId)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
+                Section("ポイントクラウドエクスポート") {
+                    Picker("形式", selection: $exportFormat) {
+                        ForEach(PointCloudFormat.allCases, id: \.self) { format in
+                            Text(format.rawValue).tag(format)
+                        }
+                    }
+
+                    Button {
+                        exportPointCloud()
+                    } label: {
+                        HStack {
+                            Label("エクスポート", systemImage: "square.and.arrow.up")
+                            Spacer()
+                            if isExporting {
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(isExporting)
+                }
+
+                if let url = exportedURL {
+                    Section("エクスポート済みファイル") {
+                        Button {
+                            showShareSheet = true
+                        } label: {
+                            Label(url.lastPathComponent, systemImage: "doc")
+                        }
+                    }
+                }
+            }
+            .navigationTitle("セッション詳細")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完了") {
+                        dismiss()
+                    }
+                }
+            }
+            .alert("エクスポート完了", isPresented: $showExportSuccess) {
+                Button("共有") {
+                    showShareSheet = true
+                }
+                Button("OK", role: .cancel) { }
+            } message: {
+                if let url = exportedURL {
+                    Text("ファイルを保存しました:\n\(url.lastPathComponent)")
+                }
+            }
+            .alert("エラー", isPresented: $showError) {
+                Button("OK") { }
+            } message: {
+                Text(errorMessage)
+            }
+            .sheet(isPresented: $showShareSheet) {
+                if let url = exportedURL {
+                    ShareSheet(url: url)
+                }
+            }
+        }
+    }
+
+    private func exportPointCloud() {
+        isExporting = true
+
+        Task {
+            do {
+                let url = try PointCloudExporter.exportFromSession(
+                    sessionDir: session.directoryURL,
+                    format: exportFormat,
+                    aggregateAll: true
+                )
+
+                await MainActor.run {
+                    exportedURL = url
+                    isExporting = false
+                    showExportSuccess = true
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    isExporting = false
+                    showError = true
+                }
+            }
+        }
+    }
 }
 
 #Preview {
