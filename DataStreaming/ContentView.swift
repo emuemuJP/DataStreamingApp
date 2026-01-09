@@ -14,9 +14,16 @@ import Combine
 
 struct ContentView: View {
     @StateObject private var sensorManager = SensorManager()
+    @StateObject private var streamingClient = StreamingClient()
+    @State private var showSettings = false
+    @State private var showRecordings = false
+    @State private var showStreaming = false
+    @State private var isSessionActive = false
+    @State private var showError = false
+    @State private var errorMessage = ""
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack {
             // RealityView と ARSession を連携
             RealityView { content in
                 content.camera = .spatialTracking
@@ -26,30 +33,317 @@ struct ContentView: View {
                 Color.clear
             }
             .ignoresSafeArea()
-            .onAppear { sensorManager.startAll() }
-            .onDisappear { sensorManager.stopAll() }
 
-            // 簡易な状態表示
-            VStack(spacing: 8) {
-                Text("Camera: \(sensorManager.cameraState)")
-                Text("Depth: \(sensorManager.depthState)")
-                Text("IMU: \(sensorManager.imuState)")
-                Text("Location: \(sensorManager.locationState)")
+            // オーバーレイUI
+            VStack {
+                // 上部: ツールバー
+                HStack {
+                    // 録画一覧ボタン
+                    Button {
+                        showRecordings = true
+                    } label: {
+                        Image(systemName: "folder.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                            .padding(12)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+
+                    // ストリーミングボタン
+                    Button {
+                        showStreaming = true
+                    } label: {
+                        ZStack {
+                            Image(systemName: "antenna.radiowaves.left.and.right")
+                                .font(.title2)
+                                .foregroundStyle(streamingClient.connectionState.isConnected ? .green : .white)
+                                .padding(12)
+                                .background(.ultraThinMaterial, in: Circle())
+
+                            if streamingClient.connectionState.isConnected {
+                                Circle()
+                                    .fill(.green)
+                                    .frame(width: 8, height: 8)
+                                    .offset(x: 14, y: -14)
+                            }
+                        }
+                    }
+
+                    Spacer()
+
+                    // ステータス表示
+                    VStack(spacing: 4) {
+                        // 録画中表示
+                        if sensorManager.status.isRecording {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(.red)
+                                    .frame(width: 8, height: 8)
+                                Text("REC")
+                                    .font(.caption.bold())
+                                Text("\(sensorManager.recordingManager.frameCount)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        // ストリーミング中表示
+                        if streamingClient.connectionState.isConnected {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.up.circle.fill")
+                                    .foregroundStyle(.green)
+                                    .font(.caption)
+                                Text("\(streamingClient.sentFrameCount)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .opacity((sensorManager.status.isRecording || streamingClient.connectionState.isConnected) ? 1 : 0)
+
+                    Spacer()
+
+                    // 設定ボタン
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Image(systemName: "gearshape.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                            .padding(12)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .disabled(isSessionActive)
+                    .opacity(isSessionActive ? 0.5 : 1.0)
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+
+                Spacer()
+
+                // 下部: ステータスと録画コントロール
+                VStack(spacing: 12) {
+                    // センサー状態表示
+                    SensorStatusPanel(sensorManager: sensorManager)
+
+                    // 録画コントロール
+                    SessionControlPanel(
+                        isActive: $isSessionActive,
+                        isRecording: $sensorManager.status.isRecording,
+                        onStart: {
+                            sensorManager.startAll()
+                            sensorManager.streamingClient = streamingClient
+                        },
+                        onStop: {
+                            sensorManager.stopAll()
+                            sensorManager.streamingClient = nil
+                        },
+                        onRecordingToggle: { toggleRecording() }
+                    )
+                }
+                .padding()
             }
-            .font(.footnote)
-            .padding(10)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-            .padding()
         }
+        .sheet(isPresented: $showSettings) {
+            SettingsView(settings: $sensorManager.settings)
+        }
+        .sheet(isPresented: $showRecordings) {
+            RecordingsListView()
+        }
+        .sheet(isPresented: $showStreaming) {
+            NavigationStack {
+                StreamingSettingsView(client: streamingClient)
+            }
+        }
+        .alert("エラー", isPresented: $showError) {
+            Button("OK") { }
+        } message: {
+            Text(errorMessage)
+        }
+    }
+
+    private func toggleRecording() {
+        do {
+            if sensorManager.status.isRecording {
+                _ = try sensorManager.stopRecording()
+            } else {
+                try sensorManager.startRecording()
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            showError = true
+        }
+    }
+}
+
+// MARK: - Sensor Status Panel
+
+struct SensorStatusPanel: View {
+    @ObservedObject var sensorManager: SensorManager
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 16) {
+                StatusIndicator(
+                    icon: "camera.fill",
+                    label: "Camera",
+                    status: sensorManager.status.camera
+                )
+                StatusIndicator(
+                    icon: "cube.transparent",
+                    label: "Depth",
+                    status: sensorManager.status.depth
+                )
+                StatusIndicator(
+                    icon: "gyroscope",
+                    label: "IMU",
+                    status: sensorManager.status.imu
+                )
+                StatusIndicator(
+                    icon: "location.fill",
+                    label: "Location",
+                    status: sensorManager.status.location
+                )
+            }
+
+            // 詳細情報
+            VStack(spacing: 2) {
+                Text(sensorManager.cameraState)
+                Text(sensorManager.depthState)
+                Text(sensorManager.imuState)
+                Text(sensorManager.locationState)
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+// MARK: - Status Indicator
+
+struct StatusIndicator: View {
+    let icon: String
+    let label: String
+    let status: SensorStatus
+
+    var statusColor: Color {
+        switch status {
+        case .running:
+            return .green
+        case .paused:
+            return .yellow
+        case .error:
+            return .red
+        case .unavailable, .denied:
+            return .gray
+        case .idle:
+            return .blue
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Circle()
+                    .fill(statusColor.opacity(0.2))
+                    .frame(width: 36, height: 36)
+
+                Image(systemName: icon)
+                    .font(.system(size: 16))
+                    .foregroundStyle(statusColor)
+            }
+
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Session Control Panel
+
+struct SessionControlPanel: View {
+    @Binding var isActive: Bool
+    @Binding var isRecording: Bool
+    var onStart: () -> Void
+    var onStop: () -> Void
+    var onRecordingToggle: () -> Void
+
+    var body: some View {
+        HStack(spacing: 20) {
+            // 開始/停止ボタン
+            Button {
+                if isActive {
+                    if isRecording {
+                        onRecordingToggle()
+                    }
+                    onStop()
+                    isActive = false
+                } else {
+                    onStart()
+                    isActive = true
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isActive ? "stop.fill" : "play.fill")
+                    Text(isActive ? "停止" : "開始")
+                }
+                .font(.headline)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+                .background(isActive ? Color.red : Color.green, in: Capsule())
+            }
+
+            // 録画ボタン（セッションがアクティブな場合のみ有効）
+            Button {
+                onRecordingToggle()
+            } label: {
+                Image(systemName: isRecording ? "record.circle.fill" : "record.circle")
+                    .font(.system(size: 32))
+                    .foregroundStyle(isRecording ? .red : .white)
+                    .symbolEffect(.pulse, options: .repeating, isActive: isRecording)
+            }
+            .disabled(!isActive)
+            .opacity(isActive ? 1.0 : 0.5)
+        }
+        .padding(12)
+        .background(.ultraThinMaterial, in: Capsule())
     }
 }
 
 final class SensorManager: NSObject, ObservableObject {
     // MARK: - Published states
+    @Published var status = SensorSystemStatus()
     @Published var cameraState: String = "idle"
     @Published var depthState: String = "idle"
     @Published var imuState: String = "idle"
     @Published var locationState: String = "idle"
+
+    // MARK: - Latest sensor data (structured)
+    @Published private(set) var latestARFrame: ARFrameSnapshot?
+    @Published private(set) var latestPointCloud: PointCloudSnapshot?
+    @Published private(set) var latestIMU: IMUSnapshot?
+    @Published private(set) var latestLocation: LocationSnapshot?
+
+    // MARK: - Settings
+    @Published var settings = RecordingSettings.default
+
+    // MARK: - Recording
+    let recordingManager = RecordingManager()
+    @Published var recordingSessionId: String?
+
+    // MARK: - Streaming
+    var streamingClient: StreamingClient?
+
+    // MARK: - Frame counter
+    private var frameCounter: UInt64 = 0
 
     // MARK: - AR
     private let arSession = ARSession()
@@ -64,6 +358,55 @@ final class SensorManager: NSObject, ObservableObject {
         super.init()
         arSession.delegate = self
         locationManager.delegate = self
+    }
+
+    // MARK: - Recording control
+
+    func startRecording() throws {
+        let sessionId = try recordingManager.startRecording(settings: settings)
+        recordingSessionId = sessionId
+        status.isRecording = true
+    }
+
+    func stopRecording() throws -> URL? {
+        let url = try recordingManager.stopRecording()
+        recordingSessionId = nil
+        status.isRecording = false
+        return url
+    }
+
+    // MARK: - Current sensor frame
+    func currentSensorFrame() -> SensorFrame {
+        frameCounter += 1
+        return SensorFrame(
+            frameId: frameCounter,
+            timestamp: .now(),
+            arFrame: latestARFrame,
+            pointCloud: settings.recordPointCloud ? latestPointCloud : nil,
+            imu: latestIMU,
+            location: latestLocation
+        )
+    }
+
+    /// センサーフレームを録画・ストリーミング
+    private func recordCurrentFrame() {
+        // 録画もストリーミングも無効な場合はスキップ
+        let shouldRecord = status.isRecording
+        let shouldStream = streamingClient?.connectionState.isConnected ?? false
+
+        guard shouldRecord || shouldStream else { return }
+
+        let frame = currentSensorFrame()
+
+        // 録画
+        if shouldRecord {
+            recordingManager.recordFrame(frame)
+        }
+
+        // ストリーミング
+        if shouldStream {
+            streamingClient?.enqueueFrame(frame)
+        }
     }
 
     // MARK: - Public control
@@ -107,15 +450,7 @@ final class SensorManager: NSObject, ObservableObject {
         depthState = (ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) ? "enabled" : "unavailable")
     }
 
-    // MARK: - Point Cloud
-    struct PointXYZRGB {
-        var x: Float
-        var y: Float
-        var z: Float
-        var r: UInt8
-        var g: UInt8
-        var b: UInt8
-    }
+    // MARK: - Point Cloud (using PointXYZRGB from Models.swift)
 
     private func generatePointCloud(from depth: ARDepthData, frame: ARFrame, downsample: Int = 4) -> [PointXYZRGB] {
         // depth.depthMap: CVPixelBuffer (kCVPixelFormatType_DepthFloat32)
@@ -220,22 +555,35 @@ final class SensorManager: NSObject, ObservableObject {
     private func startMotion() {
         guard motion.isDeviceMotionAvailable else {
             imuState = "unavailable"
+            status.imu = .unavailable
             return
         }
-        motion.deviceMotionUpdateInterval = 1.0 / 100.0 // 100 Hz
+        motion.deviceMotionUpdateInterval = 1.0 / settings.imuSamplingRate
         motion.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: .main) { [weak self] dm, err in
             guard let self, let dm else { return }
             // timestamp は起動後の経過秒
             let t = dm.timestamp
+            let syncTimestamp = SyncTimestamp.fromSensorTimestamp(t)
+
             let acc = dm.userAcceleration
             let gyro = dm.rotationRate
             let quat = dm.attitude.quaternion
+            let grav = dm.gravity
+
+            // IMUスナップショットを保存
+            self.latestIMU = IMUSnapshot(
+                timestamp: syncTimestamp,
+                userAcceleration: Vector3(x: acc.x, y: acc.y, z: acc.z),
+                rotationRate: Vector3(x: gyro.x, y: gyro.y, z: gyro.z),
+                attitude: Quaternion(x: quat.x, y: quat.y, z: quat.z, w: quat.w),
+                gravity: Vector3(x: grav.x, y: grav.y, z: grav.z)
+            )
+
             self.imuState = String(format: "%.2f s  ax:%.2f ay:%.2f az:%.2f", t, acc.x, acc.y, acc.z)
-            // TODO: サーバ送信用にバッチ化・エンコード
-            _ = gyro
-            _ = quat
+            self.status.imu = .running
         }
         imuState = "running"
+        status.imu = .running
     }
 
     // MARK: - Location setup
@@ -252,35 +600,105 @@ extension SensorManager: ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         // カメラフレームのタイムスタンプ（秒）
         let t = frame.timestamp
-        // カラー画像
-        let pixelBuffer = frame.capturedImage
-        // 深度（対応端末のみ）
-        if let depth = frame.sceneDepth ?? frame.smoothedSceneDepth {
-            let pts = generatePointCloud(from: depth, frame: frame, downsample: 4)
-            depthState = String(format: "t:%.2f depth: w:%d h:%d pts:%d", t, CVPixelBufferGetWidth(depth.depthMap), CVPixelBufferGetHeight(depth.depthMap), pts.count)
-            _ = pixelBuffer
-        } else {
-            depthState = "no-depth"
+        let syncTimestamp = SyncTimestamp.fromSensorTimestamp(t)
+
+        // カメラ内部パラメータ
+        let intrinsics = frame.camera.intrinsics
+        let cameraIntrinsics = CameraIntrinsics(
+            fx: intrinsics[0, 0],
+            fy: intrinsics[1, 1],
+            cx: intrinsics[0, 2],
+            cy: intrinsics[1, 2]
+        )
+
+        // トラッキング状態
+        let trackingState: String
+        switch frame.camera.trackingState {
+        case .normal:
+            trackingState = "normal"
+        case .limited(let reason):
+            switch reason {
+            case .initializing:
+                trackingState = "initializing"
+            case .excessiveMotion:
+                trackingState = "excessiveMotion"
+            case .insufficientFeatures:
+                trackingState = "insufficientFeatures"
+            case .relocalizing:
+                trackingState = "relocalizing"
+            @unknown default:
+                trackingState = "unknown"
+            }
+        case .notAvailable:
+            trackingState = "notAvailable"
         }
 
-        // TODO: カメラ画像のエンコード（H.264/HEVC）やサーバ送信のキューイング
+        // カラー画像
+        let pixelBuffer = frame.capturedImage
+        let imageWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let imageHeight = CVPixelBufferGetHeight(pixelBuffer)
+
+        // 深度（対応端末のみ）
+        var depthWidth: Int?
+        var depthHeight: Int?
+
+        if let depth = frame.sceneDepth ?? frame.smoothedSceneDepth {
+            depthWidth = CVPixelBufferGetWidth(depth.depthMap)
+            depthHeight = CVPixelBufferGetHeight(depth.depthMap)
+
+            let pts = generatePointCloud(from: depth, frame: frame, downsample: settings.pointCloudDownsample)
+
+            // ポイントクラウドスナップショットを保存
+            latestPointCloud = PointCloudSnapshot(
+                timestamp: syncTimestamp,
+                points: pts,
+                downsampleFactor: settings.pointCloudDownsample
+            )
+
+            depthState = String(format: "t:%.2f w:%d h:%d pts:%d", t, depthWidth!, depthHeight!, pts.count)
+            status.depth = .running
+        } else {
+            depthState = "no-depth"
+            status.depth = .unavailable
+            latestPointCloud = nil
+        }
+
+        // ARフレームスナップショットを保存
+        latestARFrame = ARFrameSnapshot(
+            timestamp: syncTimestamp,
+            intrinsics: cameraIntrinsics,
+            cameraTransform: Transform4x4(from: frame.camera.transform),
+            imageWidth: imageWidth,
+            imageHeight: imageHeight,
+            depthWidth: depthWidth,
+            depthHeight: depthHeight,
+            trackingState: trackingState
+        )
+
         cameraState = String(format: "t:%.2f", t)
+        status.camera = .running
+
+        // フレームを録画
+        recordCurrentFrame()
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
         cameraState = "error: \(error.localizedDescription)"
+        status.camera = .error
     }
 }
 
 // MARK: - CLLocationManagerDelegate
 extension SensorManager: CLLocationManagerDelegate {
-    func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) {
-        switch status {
+    func locationManager(_ manager: CLLocationManager, didChangeAuthorization authStatus: CLAuthorizationStatus) {
+        switch authStatus {
         case .authorizedAlways, .authorizedWhenInUse:
             manager.startUpdatingLocation()
             locationState = "running"
+            status.location = .running
         case .denied, .restricted:
             locationState = "denied"
+            status.location = .denied
         case .notDetermined:
             locationState = "requesting"
         @unknown default:
@@ -290,16 +708,21 @@ extension SensorManager: CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
+
+        // LocationSnapshotを保存
+        latestLocation = LocationSnapshot(from: loc)
+
         let t = loc.timestamp.timeIntervalSince1970
         let lat = loc.coordinate.latitude
         let lon = loc.coordinate.longitude
         let acc = loc.horizontalAccuracy
         locationState = String(format: "t:%.0f  lat:%.5f lon:%.5f ±%.1fm", t, lat, lon, acc)
-        // TODO: サーバ送信用に構造体化して送信
+        status.location = .running
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         locationState = "error: \(error.localizedDescription)"
+        status.location = .error
     }
 }
 
