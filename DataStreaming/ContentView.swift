@@ -5,15 +5,21 @@
 //  Created by Keita Matsumoto on 2025/12/31.
 //
 
+import Foundation
 import SwiftUI
 import RealityKit
 import ARKit
 import CoreMotion
 import CoreLocation
 import Combine
+import VideoToolbox
 
 struct ContentView: View {
     @StateObject private var sensorManager = SensorManager()
+    
+    @State private var serverAddress = "192.168.0.10"
+    @State private var serverPort = "8080"
+    @State private var useWebRTC = true
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -35,6 +41,27 @@ struct ContentView: View {
                 Text("Depth: \(sensorManager.depthState)")
                 Text("IMU: \(sensorManager.imuState)")
                 Text("Location: \(sensorManager.locationState)")
+                
+                Divider().padding(.vertical, 4)
+                HStack(spacing: 6) {
+                    TextField("IP", text: $serverAddress)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 140)
+                        .autocorrectionDisabled(true)
+                        .textInputAutocapitalization(.never)
+                    Text(":")
+                    TextField("Port", text: $serverPort)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 70)
+                        .keyboardType(.numberPad)
+                    Toggle("WebRTC", isOn: $useWebRTC)
+                        .labelsHidden()
+                    Button("接続") {
+                        let urlString = "http://\(serverAddress):\(serverPort)"
+                        sensorManager.configureTransport(baseURLString: urlString, useWebRTC: useWebRTC)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
             }
             .font(.footnote)
             .padding(10)
@@ -53,6 +80,12 @@ final class SensorManager: NSObject, ObservableObject {
 
     // MARK: - AR
     private let arSession = ARSession()
+    
+    // MARK: - Video Encoding (H.264)
+    private var vtSession: VTCompressionSession?
+    private var videoWidth: Int32 = 0
+    private var videoHeight: Int32 = 0
+    private var videoSeq: UInt32 = 0
 
     // MARK: - Motion
     private let motion = CMMotionManager()
@@ -60,6 +93,30 @@ final class SensorManager: NSObject, ObservableObject {
     // MARK: - Location
     private let locationManager = CLLocationManager()
 
+    // MARK: - Transport
+-    private let transport: Transport = LocalStubTransport(baseURL: URL(string: "http://127.0.0.1:8080")!)
++    private var transport: Transport? = nil
+    private var seqVideo: UInt32 = 0
+    private var seqPoint: UInt32 = 0
+    private var seqIMU: UInt32 = 0
+    private var seqLoc: UInt32 = 0
+
+    private func nowUnixNanos() -> UInt64 {
+        let t = Date().timeIntervalSince1970
+        return UInt64(t * 1_000_000_000)
+    }
+
++    func configureTransport(baseURLString: String, useWebRTC: Bool) {
++        guard let url = URL(string: baseURLString) else { return }
++        if useWebRTC {
++            let w = WebRTCTransport(signalingURL: url)
++            self.transport = w
++            w.start()
++        } else {
++            self.transport = LocalStubTransport(baseURL: url)
++        }
++    }
++
     override init() {
         super.init()
         arSession.delegate = self
@@ -105,6 +162,118 @@ final class SensorManager: NSObject, ObservableObject {
         arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
         cameraState = "running"
         depthState = (ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) ? "enabled" : "unavailable")
+    }
+
+    // MARK: - H.264 setup
+    private func setupH264EncoderIfNeeded(width: Int32, height: Int32) {
+        if let s = vtSession, videoWidth == width && videoHeight == height {
+            return
+        }
+        if let old = vtSession {
+            VTCompressionSessionInvalidate(old)
+            vtSession = nil
+        }
+        videoWidth = width
+        videoHeight = height
+
+        var newSession: VTCompressionSession? = nil
+        let status = VTCompressionSessionCreate(allocator: kCFAllocatorDefault,
+                                                width: width,
+                                                height: height,
+                                                codecType: kCMVideoCodecType_H264,
+                                                encoderSpecification: nil,
+                                                imageBufferAttributes: nil,
+                                                compressedDataAllocator: nil,
+                                                outputCallback: { refCon, _, status, infoFlags, sampleBuffer in
+            guard status == noErr, let sbuf = sampleBuffer, CMSampleBufferDataIsReady(sbuf) else { return }
+            let encoder = Unmanaged<SensorManager>.fromOpaque(refCon!).takeUnretainedValue()
+            encoder.handleEncodedSampleBuffer(sbuf)
+        },
+                                                refcon: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()),
+                                                compressionSessionOut: &newSession)
+        guard status == noErr, let session = newSession else {
+            print("VTCompressionSessionCreate failed: \(status)")
+            return
+        }
+        vtSession = session
+
+        // Realtime & profile
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+        // Keyframe interval
+        var keyInt: Int32 = 60
+        let keyIntNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &keyInt)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: keyIntNum)
+        // Average bitrate (例: 4Mbps)
+        var bitrate: Int32 = 4_000_000
+        let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
+
+        VTCompressionSessionPrepareToEncodeFrames(session)
+    }
+
+    private func handleEncodedSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+
+        // SPS/PPS 抽出
+        var spsData: Data?
+        var ppsData: Data?
+        var count: Int = 0
+        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(desc, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+        for i in 0..<count {
+            var ptr: UnsafePointer<UInt8>? = nil
+            var size: Int = 0
+            var hdrLen: Int32 = 0
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(desc, parameterSetIndex: i, parameterSetPointerOut: &ptr, parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: &hdrLen)
+            if let p = ptr {
+                let nal = Data(bytes: p, count: size)
+                if nal.first == 0x67 { spsData = nal } // SPS
+                else if nal.first == 0x68 { ppsData = nal } // PPS
+            }
+        }
+
+        // Annex B形式で出力（00 00 00 01 + NAL）
+        func annexB(_ nal: Data) -> Data {
+            var start: [UInt8] = [0,0,0,1]
+            var d = Data(bytes: &start, count: 4)
+            d.append(nal)
+            return d
+        }
+
+        var out = Data()
+        if let sps = spsData { out.append(annexB(sps)) }
+        if let pps = ppsData { out.append(annexB(pps)) }
+
+        guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        var totalLength: Int = 0
+        var dataPointer: UnsafeMutablePointer<Int8>? = nil
+        CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
+        guard let dp = dataPointer else { return }
+
+        var offset = 0
+        while offset + 4 < totalLength {
+            // AVCC length-prefixed NAL -> Annex B
+            let nalLength = dp.advanced(by: offset).withMemoryRebound(to: UInt32.self, capacity: 1) { $0.pointee }.bigEndian
+            let nalStart = offset + 4
+            let nal = Data(bytes: dp.advanced(by: nalStart), count: Int(nalLength))
+            out.append(annexB(nal))
+            offset += 4 + Int(nalLength)
+        }
+
+        // ここで out が1フレームのAnnexB H.264バイト列
+        videoSeq &+= 1
+        seqVideo &+= 1
+        let ts = nowUnixNanos()
+-        transport.send(sensor: .video, timestampNanos: ts, sequence: seqVideo, payload: out)
++        transport?.send(sensor: .video, timestampNanos: ts, sequence: seqVideo, payload: out)
+        print("H264 frame bytes: \(out.count) seq: \(videoSeq)")
+    }
+
+    private func encodePixelBufferH264(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+        guard let session = vtSession else { return }
+        let flags: VTEncodeInfoFlags = []
+-        VTCompressionSessionEncodeFrame(session, imageBuffer: pixelBuffer, presentationTimeStamp: pts, duration: .invalid, frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: UnsafeMutablePointer(mutating: [flags]))
++        VTCompressionSessionEncodeFrame(session, imageBuffer: pixelBuffer, presentationTimeStamp: pts, duration: .invalid, frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: UnsafeMutablePointer(mutating: [flags]))
     }
 
     // MARK: - Point Cloud
@@ -231,9 +400,20 @@ final class SensorManager: NSObject, ObservableObject {
             let gyro = dm.rotationRate
             let quat = dm.attitude.quaternion
             self.imuState = String(format: "%.2f s  ax:%.2f ay:%.2f az:%.2f", t, acc.x, acc.y, acc.z)
-            // TODO: サーバ送信用にバッチ化・エンコード
-            _ = gyro
-            _ = quat
+            // IMU送信（単発）
+            var payload = Data()
+            // timestampDeltaNanos は簡易的に0を入れる
+            var zero32: UInt32 = 0
+            payload.append(Data(bytes: &zero32, count: 4))
+            var ax = Float32(acc.x), ay = Float32(acc.y), az = Float32(acc.z)
+            var gx = Float32(dm.rotationRate.x), gy = Float32(dm.rotationRate.y), gz = Float32(dm.rotationRate.z)
+            var qw = Float32(quat.w), qx = Float32(quat.x), qy = Float32(quat.y), qz = Float32(quat.z)
+            for v in [ax, ay, az, gx, gy, gz, qw, qx, qy, qz] {
+                var vv = v
+                withUnsafeBytes(of: &vv) { payload.append(contentsOf: $0) }
+            }
+            seqIMU &+= 1
+            transport?.send(sensor: .imu, timestampNanos: nowUnixNanos(), sequence: seqIMU, payload: payload)
         }
         imuState = "running"
     }
@@ -258,13 +438,31 @@ extension SensorManager: ARSessionDelegate {
         if let depth = frame.sceneDepth ?? frame.smoothedSceneDepth {
             let pts = generatePointCloud(from: depth, frame: frame, downsample: 4)
             depthState = String(format: "t:%.2f depth: w:%d h:%d pts:%d", t, CVPixelBufferGetWidth(depth.depthMap), CVPixelBufferGetHeight(depth.depthMap), pts.count)
-            _ = pixelBuffer
+            // 点群送信（XYZRGB float32 + uint8 をそのまま詰める簡易版）
+            var payload = Data()
+            // count (UInt32 little endian)
+            var countLE = UInt32(pts.count).littleEndian
+            payload.append(Data(bytes: &countLE, count: 4))
+            for p in pts {
+                var x = p.x, y = p.y, z = p.z
+                withUnsafeBytes(of: &x) { payload.append(contentsOf: $0) }
+                withUnsafeBytes(of: &y) { payload.append(contentsOf: $0) }
+                withUnsafeBytes(of: &z) { payload.append(contentsOf: $0) }
+                payload.append(contentsOf: [p.r, p.g, p.b])
+            }
+            seqPoint &+= 1
+-            transport.send(sensor: .pointCloud, timestampNanos: nowUnixNanos(), sequence: seqPoint, payload: payload)
++            transport?.send(sensor: .pointCloud, timestampNanos: nowUnixNanos(), sequence: seqPoint, payload: payload)
         } else {
             depthState = "no-depth"
         }
 
-        // TODO: カメラ画像のエンコード（H.264/HEVC）やサーバ送信のキューイング
-        cameraState = String(format: "t:%.2f", t)
+        // H.264 エンコード
+        let w = Int32(CVPixelBufferGetWidth(pixelBuffer))
+        let h = Int32(CVPixelBufferGetHeight(pixelBuffer))
+        setupH264EncoderIfNeeded(width: w, height: h)
+        encodePixelBufferH264(pixelBuffer, pts: CMTime(seconds: t, preferredTimescale: 1_000_000_000))
+        cameraState = String(format: "t:%.2f w:%d h:%d", t, w, h)
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
@@ -295,6 +493,25 @@ extension SensorManager: CLLocationManagerDelegate {
         let lon = loc.coordinate.longitude
         let acc = loc.horizontalAccuracy
         locationState = String(format: "t:%.0f  lat:%.5f lon:%.5f ±%.1fm", t, lat, lon, acc)
+        // 位置情報送信（簡易バイナリ）
+        var payload = Data()
+        var latLE = lat.bitPattern.littleEndian
+        var lonLE = lon.bitPattern.littleEndian
+        var altLE = loc.altitude.bitPattern.littleEndian
+        var hAccLE = loc.horizontalAccuracy.bitPattern.littleEndian
+        var vAccLE = loc.verticalAccuracy.bitPattern.littleEndian
+        var speedLE = loc.speed.bitPattern.littleEndian
+        var courseLE = loc.course.bitPattern.littleEndian
+        payload.append(Data(bytes: &latLE, count: 8))
+        payload.append(Data(bytes: &lonLE, count: 8))
+        payload.append(Data(bytes: &altLE, count: 8))
+        payload.append(Data(bytes: &hAccLE, count: 4))
+        payload.append(Data(bytes: &vAccLE, count: 4))
+        payload.append(Data(bytes: &speedLE, count: 4))
+        payload.append(Data(bytes: &courseLE, count: 4))
+        seqLoc &+= 1
+-        transport.send(sensor: .location, timestampNanos: nowUnixNanos(), sequence: seqLoc, payload: payload)
++        transport?.send(sensor: .location, timestampNanos: nowUnixNanos(), sequence: seqLoc, payload: payload)
         // TODO: サーバ送信用に構造体化して送信
     }
 
